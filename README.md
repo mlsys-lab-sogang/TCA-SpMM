@@ -1,8 +1,8 @@
 # TCA-SpMM
 
-## To run the program:
-  cd src
-  
-  make
-  
-  ./test {input matrix name}
+## To compile and run the program
+```bash
+cd src
+make
+./test {input matrix file}
+```
