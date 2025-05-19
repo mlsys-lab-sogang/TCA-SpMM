@@ -21,7 +21,6 @@ static __device__ void flush_output(float *output, float *output_buffer, int out
         reinterpret_cast<float4 *>(&output_buffer[i])[0] = float4{0, 0, 0, 0};
     }
 }
-
 template <const int output_tile_width>
 static __device__ void multirow_per_tb(half *spmat_val, const int *row_offset, int *col_idx, half *B, float *C,
                                        const int M, const int N, const int K, const float alpha, const float beta,
@@ -45,16 +44,17 @@ static __device__ void multirow_per_tb(half *spmat_val, const int *row_offset, i
     int2 fetching_idx;
     fetching_idx.x = warpid_current_row * 8 + 2 * (laneid / 8);
     fetching_idx.y = fetching_idx.x + 1;
+
     int2 fetching_col = {-1, -1};
 
     half2 Aval_tmp = {0, 0};
     int fetching_col_lane = 8 * (laneid % 8);
-    if (fetching_idx.x < sparse_row_nnz)
+    if (fetching_idx.x < sparse_row_nnz && fetching_col_lane < N)
     {
         fetching_col.x = col_idx[row_start + fetching_idx.x] * N + fetching_col_lane;
         Aval_tmp.x = spmat_val[row_start + fetching_idx.x];
     }
-    if (fetching_idx.y < sparse_row_nnz)
+    if (fetching_idx.y < sparse_row_nnz && fetching_col_lane < N)
     {
         fetching_col.y = col_idx[row_start + fetching_idx.y] * N + fetching_col_lane;
         Aval_tmp.y = spmat_val[row_start + fetching_idx.y];
@@ -81,6 +81,8 @@ static __device__ void multirow_per_tb(half *spmat_val, const int *row_offset, i
 
     int shm_row_step = 64 / B_scratch_leading_dim;
     bool writing_lane = (laneid % (4 * no_warps_within_row) == 0);
+
+    int tile = 0;
     for (int tile = 0; tile < N; tile += output_tile_width)
     {
         fetch_buffer1 = uint4{0, 0, 0, 0};
@@ -105,6 +107,7 @@ static __device__ void multirow_per_tb(half *spmat_val, const int *row_offset, i
         }
 
         __syncthreads();
+
         float2 val;
         for (int idx = 0; idx < 4; idx++)
         {
@@ -145,12 +148,13 @@ static __device__ void multirow_per_tb(half *spmat_val, const int *row_offset, i
         }
         filled_buffer += 64;
         __syncthreads();
-        if (filled_buffer == output_buffer_size)
+        if (filled_buffer >= output_buffer_size)
         {
             flush_output(output_row, output_buffer, output_buffer_size, warpid_current_row, laneid, no_warps_within_row);
 
             filled_buffer = 0;
             output_row = &output_row[output_buffer_size];
+            output_buffer_size = min(output_buffer_size, N - tile - output_tile_width);
         }
     }
 }
@@ -184,6 +188,7 @@ static __device__ void multitb_per_row(half *spmat_val, const int *row_offset, i
     int B_scratch_leading_dim = 64;
 
     uint4 fetch_buffer1;
+    uint4 s;
     uint4 fetch_buffer2;
 
     int fetching_col_lane = 8 * (laneid % 8);
@@ -210,7 +215,7 @@ static __device__ void multitb_per_row(half *spmat_val, const int *row_offset, i
             fetch_buffer1 = uint4{0, 0, 0, 0};
             fetch_buffer2 = uint4{0, 0, 0, 0};
 
-            if (fetching_idx.x < sparse_row_nnz)
+            if (fetching_idx.x < sparse_row_nnz && tile + fetching_col_lane < N)
             {
                 fetching_col.x = col_idx[row_start + fetching_idx.x] * N + tile + fetching_col_lane;
                 Aval_tmp.x = spmat_val[row_start + fetching_idx.x];
@@ -218,13 +223,14 @@ static __device__ void multitb_per_row(half *spmat_val, const int *row_offset, i
                 if (fetching_col.x < K * N)
                     fetch_buffer1 = reinterpret_cast<uint4 *>(&B[fetching_col.x])[0];
             }
-            if (fetching_idx.y < sparse_row_nnz)
+            if (fetching_idx.y < sparse_row_nnz && tile + fetching_col_lane < N)
             {
                 fetching_col.y = col_idx[row_start + fetching_idx.y] * N + tile + fetching_col_lane;
                 Aval_tmp.y = spmat_val[row_start + fetching_idx.y];
                 if (fetching_col.y < K * N)
                     fetch_buffer2 = reinterpret_cast<uint4 *>(&B[fetching_col.y])[0];
             }
+            __syncthreads();
             int transpose_idx = first_transpose_idx;
             for (int st = 0; st < 8; st++)
             {
@@ -275,9 +281,9 @@ static __device__ void multitb_per_row(half *spmat_val, const int *row_offset, i
             }
             __syncthreads();
         }
-        // __syncthreads();
+        __syncthreads();
         filled_buffer += output_tile_width;
-        if (filled_buffer == output_buffer_size)
+        if (filled_buffer >= output_buffer_size)
         {
             flush_output(output_row, output_buffer, output_buffer_size, warpid, laneid, no_warps_within_row);
 
